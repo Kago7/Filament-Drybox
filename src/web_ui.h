@@ -394,9 +394,11 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       samples: [],
       status: null,
       historyLimit: 720,
-      historyIntervalSeconds: 30,
+      historyIntervalSeconds: 5,
       historyRequestId: 0,
       hoverIndex: null,
+      historyLoading: false,
+      historyAnimationId: 0,
       setTemperatureC: 45,
       setTemperatureDirty: false
     };
@@ -425,6 +427,10 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
 
     function renderHistoryMeta() {
       const meta = document.getElementById('historyMeta');
+      if (state.historyLoading) {
+        meta.textContent = `${selectedRangeLabel()} · Updating...`;
+        return;
+      }
       if (!state.status) {
         meta.textContent = 'Loading RAM buffer';
         return;
@@ -556,19 +562,84 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       const requestId = ++state.historyRequestId;
       state.historyLimit = limit;
       state.hoverIndex = null;
-      state.samples = [];
+      state.historyLoading = true;
       renderHistoryMeta();
-      drawCombinedChart();
       try {
         const history = await fetchJson(`/api/history?limit=${limit}`);
         if (requestId !== state.historyRequestId) return;
-        state.historyIntervalSeconds = Number(history.sample_interval_s) || 30;
-        state.samples = history.samples || [];
-        renderHistoryMeta();
-        drawCombinedChart();
+        state.historyIntervalSeconds = Number(history.sample_interval_s) || 5;
+        animateHistorySamples(history.samples || []);
       } catch (error) {
+        if (requestId !== state.historyRequestId) return;
+        state.historyLoading = false;
+        renderHistoryMeta();
         setError(`History unavailable: ${error.message}`);
       }
+    }
+
+    const historySampleKeys = [
+      'age_s',
+      'aht20_temp',
+      'bmp280_temp',
+      'aht20_rh',
+      'bmp280_pressure',
+      'heater_fan_pwm',
+      'heater_pwm',
+      'exhaust_fan_pwm'
+    ];
+
+    function blendHistoryValue(previousValue, nextValue, progress) {
+      const hasPrevious = Number.isFinite(previousValue);
+      const hasNext = Number.isFinite(nextValue);
+      if (hasPrevious && hasNext) {
+        return previousValue + (nextValue - previousValue) * progress;
+      }
+      return progress < 0.5
+        ? (hasPrevious ? previousValue : null)
+        : (hasNext ? nextValue : null);
+    }
+
+    function blendHistorySamples(previousSamples, nextSamples, progress) {
+      return nextSamples.map((nextSample, nextIndex) => {
+        const previousPosition = previousSamples.length > 1 && nextSamples.length > 1
+          ? nextIndex * (previousSamples.length - 1) / (nextSamples.length - 1)
+          : 0;
+        const previousIndex = Math.min(Math.round(previousPosition), Math.max(previousSamples.length - 1, 0));
+        const previousSample = previousSamples[previousIndex] || {};
+        const blendedSample = {};
+        historySampleKeys.forEach(key => {
+          blendedSample[key] = blendHistoryValue(previousSample[key], nextSample[key], progress);
+        });
+        return blendedSample;
+      });
+    }
+
+    function animateHistorySamples(nextSamples) {
+      const previousSamples = state.samples;
+      const animationId = ++state.historyAnimationId;
+      if (!previousSamples.length || !nextSamples.length) {
+        state.samples = nextSamples;
+        state.historyLoading = false;
+        renderHistoryMeta();
+        drawCombinedChart();
+        return;
+      }
+
+      const animationStart = performance.now();
+      const animationDuration = 350;
+      const animate = now => {
+        if (animationId !== state.historyAnimationId) return;
+        const progress = Math.min(1, (now - animationStart) / animationDuration);
+        state.samples = blendHistorySamples(previousSamples, nextSamples, progress);
+        if (progress >= 1) {
+          state.samples = nextSamples;
+          state.historyLoading = false;
+        }
+        renderHistoryMeta();
+        drawCombinedChart();
+        if (progress < 1) requestAnimationFrame(animate);
+      };
+      requestAnimationFrame(animate);
     }
 
     function hideChartTooltip() {
@@ -777,7 +848,7 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
     refreshStatus();
     refreshHistory();
     setInterval(refreshStatus, 5000);
-    setInterval(refreshHistory, 30000);
+    setInterval(refreshHistory, 5000);
   </script>
 </body>
 </html>

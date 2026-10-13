@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
 #include <ESPmDNS.h>
 #include <U8g2lib.h>
 #include <WebServer.h>
@@ -20,20 +22,21 @@ uint8_t exhaust_fan_pwm = 0;
 namespace {
 constexpr char kHostname[] = "drybox";
 constexpr uint16_t kHttpPort = 80;
-constexpr uint32_t kSampleIntervalMs = 30000;
-#ifndef DRYBOX_HISTORY_CAPACITY
-#define DRYBOX_HISTORY_CAPACITY 4096
-#endif
-constexpr size_t kHistoryCapacity = DRYBOX_HISTORY_CAPACITY;
+constexpr uint32_t kSampleIntervalMs = 5000;
+constexpr size_t kHistoryCapacity = 4096;
 constexpr size_t kStreamChunkSize = 1024;
 constexpr uint8_t kI2cSdaPin = 5;
 constexpr uint8_t kI2cSclPin = 6;
+constexpr uint8_t kHeaterPwmPin = 4;
+constexpr uint8_t kExhaustFanPwmPin = 3;
+constexpr uint8_t kHeaterPwmChannel = 0;
+constexpr uint8_t kExhaustFanPwmChannel = 2;
+constexpr uint8_t kPwmResolutionBits = 8;
+constexpr uint32_t kHeaterPwmFrequencyHz = 1000;
+constexpr uint32_t kExhaustFanPwmFrequencyHz = 1000;
 constexpr uint8_t kOledI2cAddress = 0x3C;
-constexpr uint8_t kOledVisibleWidth = 72;
-constexpr uint8_t kOledVisibleHeight = 40;
-constexpr uint8_t kOledXOffset = 30;
-constexpr uint8_t kOledYOffset = 12;
-constexpr uint32_t kOledRefreshMs = 1000;
+constexpr uint32_t kOledRefreshMs = 2000;
+constexpr uint32_t kSensorRefreshMs = 1000;
 constexpr float kMinimumSafeTemperatureC = 0.0f;
 constexpr float kMaximumSafeTemperatureC = 65.0f;
 constexpr float kDefaultDryingSetTemperatureC = 45.0f;
@@ -67,22 +70,110 @@ size_t historyHead = 0;
 size_t historyCount = 0;
 uint32_t nextSampleAtMs = 0;
 WebServer server(kHttpPort);
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(
-  U8G2_R0,
-  U8X8_PIN_NONE,
-  kI2cSclPin,
-  kI2cSdaPin
-);
+U8G2_SSD1306_72X40_ER_F_HW_I2C oled(U8G2_R2, U8X8_PIN_NONE);
 bool oledAvailable = false;
 uint32_t nextOledUpdateMs = 0;
+bool showTemperatureOnOled = true;
 DryingState dryingState = DryingState::Idle;
 float dryingSetTemperatureC = kDefaultDryingSetTemperatureC;
 uint32_t dryingDurationMs = kDefaultDryingDurationMs;
 uint32_t dryingStartedAtMs = 0;
 uint32_t nextWifiReconnectAttemptMs = 0;
 bool wifiWasConnected = false;
+bool wifiConfigured = false;
+bool webServerStarted = false;
+bool mdnsStarted = false;
+bool pwmOutputsReady = false;
+Adafruit_AHTX0 aht20;
+Adafruit_BMP280 bmp280(&Wire);
+bool aht20Available = false;
+bool bmp280Available = false;
+uint32_t nextSensorReadMs = 0;
 
 float averageAirTemperature();
+
+void initializePwmOutputs() {
+  pinMode(kHeaterPwmPin, OUTPUT);
+  pinMode(kExhaustFanPwmPin, OUTPUT);
+  digitalWrite(kHeaterPwmPin, LOW);
+  digitalWrite(kExhaustFanPwmPin, LOW);
+
+  if (ledcSetup(kHeaterPwmChannel, kHeaterPwmFrequencyHz, kPwmResolutionBits) == 0
+      || ledcSetup(kExhaustFanPwmChannel, kExhaustFanPwmFrequencyHz, kPwmResolutionBits) == 0) {
+    return;
+  }
+
+  ledcWrite(kHeaterPwmChannel, 0);
+  ledcWrite(kExhaustFanPwmChannel, 0);
+  ledcAttachPin(kHeaterPwmPin, kHeaterPwmChannel);
+  ledcAttachPin(kExhaustFanPwmPin, kExhaustFanPwmChannel);
+  pwmOutputsReady = true;
+}
+
+void initializeSensors() {
+  aht20Available = aht20.begin(&Wire);
+  if (aht20Available) {
+    Serial.println("AHT20 initialized on I2C address 0x38.");
+  } else {
+    Serial.println("AHT20 not detected; using fallback sensor values.");
+  }
+
+  bmp280Available = bmp280.begin(BMP280_ADDRESS);
+  if (!bmp280Available) {
+    bmp280Available = bmp280.begin(BMP280_ADDRESS_ALT);
+  }
+  if (bmp280Available) {
+    bmp280.setSampling(
+      Adafruit_BMP280::MODE_NORMAL,
+      Adafruit_BMP280::SAMPLING_X2,
+      Adafruit_BMP280::SAMPLING_X16,
+      Adafruit_BMP280::FILTER_X4,
+      Adafruit_BMP280::STANDBY_MS_125
+    );
+    Serial.println("BMP280 initialized on I2C address 0x76/0x77.");
+  } else {
+    Serial.println("BMP280 not detected; using fallback sensor values.");
+  }
+}
+
+void readSensors(uint32_t now) {
+  if (static_cast<int32_t>(now - nextSensorReadMs) < 0) {
+    return;
+  }
+  nextSensorReadMs = now + kSensorRefreshMs;
+
+  if (aht20Available) {
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
+    if (aht20.getEvent(&humidityEvent, &temperatureEvent)
+        && std::isfinite(temperatureEvent.temperature)
+        && std::isfinite(humidityEvent.relative_humidity)) {
+      aht20_temp = temperatureEvent.temperature;
+      aht20_rh = humidityEvent.relative_humidity;
+    } else {
+      aht20_temp = -1.0f;
+      aht20_rh = -1.0f;
+    }
+  } else {
+    aht20_temp = -1.0f;
+    aht20_rh = -1.0f;
+  }
+
+  if (bmp280Available) {
+    const float temperature = bmp280.readTemperature();
+    const float pressurePa = bmp280.readPressure();
+    if (std::isfinite(temperature) && std::isfinite(pressurePa) && pressurePa > 0.0f) {
+      bmp280_temp = temperature;
+      bmp280_pressure = pressurePa / 100.0f;
+    } else {
+      bmp280_temp = -1.0f;
+      bmp280_pressure = -1.0f;
+    }
+  } else {
+    bmp280_temp = -1.0f;
+    bmp280_pressure = -1.0f;
+  }
+}
 
 bool temperaturesAreSafe() {
   return std::isfinite(aht20_temp)
@@ -97,6 +188,10 @@ void forceOutputsOff() {
   heater_fan_pwm = 0;
   heater_pwm = 0;
   exhaust_fan_pwm = 0;
+  if (pwmOutputsReady) {
+    ledcWrite(kHeaterPwmChannel, 0);
+    ledcWrite(kExhaustFanPwmChannel, 0);
+  }
 }
 
 const char* dryingStateName() {
@@ -111,6 +206,9 @@ const char* dryingStateName() {
 
 const char* dryingSafetyReason() {
   if (dryingState == DryingState::SafetyShutdown) {
+    if (!pwmOutputsReady) {
+      return "PWM outputs unavailable";
+    }
     return "Temperature outside 0-65 C";
   }
   if (dryingState == DryingState::TimerExpired) {
@@ -131,6 +229,14 @@ uint32_t dryingRemainingSeconds(uint32_t now) {
 }
 
 void updateDryingControl(uint32_t now) {
+  if (!pwmOutputsReady) {
+    forceOutputsOff();
+    if (dryingState == DryingState::Drying) {
+      dryingState = DryingState::SafetyShutdown;
+    }
+    return;
+  }
+
   if (!temperaturesAreSafe()) {
     forceOutputsOff();
     if (dryingState == DryingState::Drying) {
@@ -164,6 +270,8 @@ void updateDryingControl(uint32_t now) {
   } else if (averageTemperature >= dryingSetTemperatureC + kHeaterHysteresisC) {
     heater_pwm = 0;
   }
+  ledcWrite(kExhaustFanPwmChannel, exhaust_fan_pwm);
+  ledcWrite(kHeaterPwmChannel, heater_pwm);
 }
 
 float averageAirTemperature() {
@@ -180,56 +288,42 @@ float averageAirTemperature() {
   return validReadings == 0 ? NAN : sum / validReadings;
 }
 
-bool probeOled() {
-  Wire.beginTransmission(kOledI2cAddress);
-  return Wire.endTransmission() == 0;
-}
-
-void initializeOled() {
-  if (!probeOled()) {
-    Serial.printf(
-      "OLED not detected at 0x%02X on SDA GPIO %u / SCL GPIO %u.\n",
-      kOledI2cAddress
-      , kI2cSdaPin
-      , kI2cSclPin
-    );
-    return;
-  }
-
-  oled.setI2CAddress(kOledI2cAddress << 1);
-  oled.setBusClock(400000);
-  oled.begin();
-  oled.setContrast(255);
-  oled.setFont(u8g2_font_4x6_tr);
-  oledAvailable = true;
-  Serial.println("Onboard OLED initialized on SDA GPIO 5 / SCL GPIO 6.");
-}
-
 void updateOled() {
   if (!oledAvailable || static_cast<int32_t>(millis() - nextOledUpdateMs) < 0) {
     return;
   }
   nextOledUpdateMs = millis() + kOledRefreshMs;
 
-  const float averageTemperature = averageAirTemperature();
-  char temperatureText[20];
-  char humidityText[20];
-  if (std::isfinite(averageTemperature)) {
-    snprintf(temperatureText, sizeof(temperatureText), "AVG: %.1f C", averageTemperature);
+  char reading[16];
+  if (showTemperatureOnOled) {
+    const float averageTemperature = averageAirTemperature();
+    if (std::isfinite(averageTemperature) && averageTemperature >= 0.0f && averageTemperature <= 125.0f) {
+      snprintf(reading, sizeof(reading), "%dC", static_cast<int>(std::lround(averageTemperature)));
+    } else {
+      strlcpy(reading, "--C", sizeof(reading));
+    }
+  } else if (std::isfinite(aht20_rh) && aht20_rh >= 0.0f && aht20_rh <= 100.0f) {
+    snprintf(reading, sizeof(reading), "%d%%", static_cast<int>(std::lround(aht20_rh)));
   } else {
-    strlcpy(temperatureText, "AVG: --.- C", sizeof(temperatureText));
+    strlcpy(reading, "--%", sizeof(reading));
   }
-  if (std::isfinite(aht20_rh)) {
-    snprintf(humidityText, sizeof(humidityText), "RH: %.1f %%", aht20_rh);
-  } else {
-    strlcpy(humidityText, "RH: --.- %", sizeof(humidityText));
-  }
+  showTemperatureOnOled = !showTemperatureOnOled;
 
   oled.clearBuffer();
-  oled.drawStr(kOledXOffset, kOledYOffset + 10, temperatureText);
-  oled.drawStr(kOledXOffset, kOledYOffset + 20, humidityText);
+  oled.setFont(u8g2_font_logisoso28_tr);
+  if (oled.getStrWidth(reading) > oled.getDisplayWidth()) {
+    oled.setFont(u8g2_font_helvB24_tr);
+  }
+  if (oled.getStrWidth(reading) > oled.getDisplayWidth()) {
+    oled.setFont(u8g2_font_helvB18_tr);
+  }
+  const uint8_t x = (oled.getDisplayWidth() - oled.getStrWidth(reading)) / 2;
+  const uint8_t y = (oled.getDisplayHeight() + oled.getAscent() + oled.getDescent()) / 2;
+  oled.drawStr(x, y, reading);
   oled.sendBuffer();
 }
+
+void startWebServer();
 
 void maintainWiFi(uint32_t now) {
   const bool wifiConnected = WiFi.status() == WL_CONNECTED;
@@ -237,6 +331,7 @@ void maintainWiFi(uint32_t now) {
     if (!wifiWasConnected) {
       wifiWasConnected = true;
       Serial.printf("Wi-Fi reconnected: http://%s\n", WiFi.localIP().toString().c_str());
+      startWebServer();
     }
     return;
   }
@@ -244,10 +339,14 @@ void maintainWiFi(uint32_t now) {
   if (wifiWasConnected) {
     wifiWasConnected = false;
     Serial.println("Wi-Fi connection lost; reconnecting...");
+    if (mdnsStarted) {
+      MDNS.end();
+      mdnsStarted = false;
+    }
     nextWifiReconnectAttemptMs = now;
   }
 
-  if (static_cast<int32_t>(now - nextWifiReconnectAttemptMs) >= 0) {
+  if (wifiConfigured && static_cast<int32_t>(now - nextWifiReconnectAttemptMs) >= 0) {
     Serial.println("Wi-Fi reconnect attempt.");
     WiFi.reconnect();
     nextWifiReconnectAttemptMs = now + kWifiReconnectIntervalMs;
@@ -380,7 +479,9 @@ void handleStatus() {
   json += now / 1000;
   json += F(",\"free_heap_bytes\":");
   json += ESP.getFreeHeap();
-  json += F(",\"sample_interval_s\":30,\"history_capacity\":");
+  json += F(",\"sample_interval_s\":");
+  json += kSampleIntervalMs / 1000;
+  json += F(",\"history_capacity\":");
   json += kHistoryCapacity;
   json += F(",\"history_bytes\":");
   json += sizeof(history);
@@ -447,7 +548,9 @@ void handleHistory() {
   server.sendHeader("Cache-Control", "no-store");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
-  server.sendContent("{\"sample_interval_s\":30,\"samples\":[");
+  server.sendContent("{\"sample_interval_s\":");
+  server.sendContent(String(kSampleIntervalMs / 1000));
+  server.sendContent(",\"samples\":[");
 
   String chunk;
   chunk.reserve(kStreamChunkSize);
@@ -538,11 +641,10 @@ void handleHistoryCsv() {
 }
 
 void connectToWiFi() {
-  if (strcmp(drybox_credentials::kSsid, "YOUR_WIFI_SSID") == 0) {
+  wifiConfigured = strcmp(drybox_credentials::kSsid, "YOUR_WIFI_SSID") != 0;
+  if (!wifiConfigured) {
     Serial.println("Set Wi-Fi credentials in include/wifi_credentials.h.");
-    while (true) {
-      delay(1000);
-    }
+    return;
   }
 
   WiFi.persistent(false);
@@ -550,26 +652,13 @@ void connectToWiFi() {
   WiFi.setAutoReconnect(true);
   WiFi.setHostname(kHostname);
   WiFi.begin(drybox_credentials::kSsid, drybox_credentials::kPassword);
-
-  Serial.print("Connecting to Wi-Fi");
-  uint32_t lastProgressAtMs = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    Serial.print('.');
-    if (millis() - lastProgressAtMs >= 10000) {
-      Serial.println(" retrying");
-      WiFi.disconnect();
-      WiFi.begin(drybox_credentials::kSsid, drybox_credentials::kPassword);
-      lastProgressAtMs = millis();
-    }
-  }
-  wifiWasConnected = true;
   nextWifiReconnectAttemptMs = millis() + kWifiReconnectIntervalMs;
-  Serial.printf("\nConnected: http://%s\n", WiFi.localIP().toString().c_str());
+  Serial.println("Connecting to Wi-Fi in the background...");
 }
 
 void startWebServer() {
   if (MDNS.begin(kHostname)) {
+    mdnsStarted = true;
     MDNS.setInstanceName("Drybox Controller");
     MDNS.addService("http", "tcp", kHttpPort);
     Serial.println("mDNS: http://drybox.local");
@@ -577,6 +666,9 @@ void startWebServer() {
     Serial.println("mDNS failed; use the printed IP address.");
   }
 
+  if (webServerStarted) {
+    return;
+  }
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/drying", HTTP_GET, handleDryingControl);
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -586,27 +678,42 @@ void startWebServer() {
     server.send(404, "application/json", "{\"error\":\"not found\"}");
   });
   server.begin();
+  webServerStarted = true;
 }
 }  // namespace
 
 void setup() {
+  initializePwmOutputs();
   Serial.begin(115200);
   delay(5000);
-  Wire.begin(kI2cSdaPin, kI2cSclPin);
-  Wire.setClock(400000);
-  initializeOled();
+  Serial.println("Drybox booting...");
+
+  Wire.begin(kI2cSdaPin, kI2cSclPin, 400000);
+  oled.setI2CAddress(kOledI2cAddress << 1);
+  oled.setBusClock(400000);
+  oled.begin();
+  oled.setContrast(150);
+  oledAvailable = true;
+  Serial.println("Onboard OLED initialized on SDA GPIO 5 / SCL GPIO 6.");
+
+  initializeSensors();
+  const uint32_t now = millis();
+  readSensors(now);
+  captureSample(now);
+  nextSampleAtMs = now + kSampleIntervalMs;
+  updateOled();
   connectToWiFi();
-  captureSample(millis());
-  nextSampleAtMs = millis() + kSampleIntervalMs;
-  startWebServer();
 }
 
 void loop() {
   const uint32_t now = millis();
   maintainWiFi(now);
-  server.handleClient();
+  if (webServerStarted && wifiWasConnected) {
+    server.handleClient();
+  }
   updateOled();
 
+  readSensors(now);
   updateDryingControl(now);
   if (static_cast<int32_t>(now - nextSampleAtMs) >= 0) {
     captureSample(now);
