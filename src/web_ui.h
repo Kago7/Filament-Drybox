@@ -150,7 +150,7 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
     .drying-control-head { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
     .drying-control-head h2 { margin: 0; font-size: 20px; }
     .drying-state { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
-    .drying-fields { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) auto; gap: 12px; align-items: end; margin-top: 16px; }
+    .drying-fields { display: grid; grid-template-columns: minmax(140px, 1.4fr) repeat(2, minmax(70px, .7fr)) auto; gap: 12px; align-items: end; margin-top: 16px; }
     .drying-field { min-width: 0; }
     .drying-field label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
     .drying-field input {
@@ -298,6 +298,7 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       .range-select { width: 100%; }
       canvas { height: 250px; }
       .drying-fields { grid-template-columns: 1fr 1fr; }
+      .drying-fields > .drying-field:first-child { grid-column: 1 / -1; }
       .drying-toggle { grid-column: 1 / -1; width: 100%; }
     }
   </style>
@@ -331,7 +332,8 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       <div class="drying-control-head"><h2 id="dryingHeading">Drying cycle</h2><span id="dryingState" class="drying-state">Idle</span></div>
       <div class="drying-fields">
         <div class="drying-field"><label for="setTemperature">Set temperature (°C)</label><input id="setTemperature" type="number" min="0" max="65" step="0.5" value="45"></div>
-        <div class="drying-field"><label for="dryingDuration">Timer (minutes)</label><input id="dryingDuration" type="number" min="1" max="120" step="1" value="30"></div>
+        <div class="drying-field"><label for="dryingHours">Timer (hours)</label><input id="dryingHours" type="number" min="0" max="24" step="1" value="0"></div>
+        <div class="drying-field"><label for="dryingMinutes">Timer (minutes)</label><input id="dryingMinutes" type="number" min="0" max="59" step="1" value="30"></div>
         <button id="dryingToggle" class="drying-toggle" type="button">Start drying</button>
       </div>
       <div id="dryingSafety" class="drying-safety">Temperature safety: waiting for both sensors</div>
@@ -400,7 +402,8 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       historyLoading: false,
       historyAnimationId: 0,
       setTemperatureC: 45,
-      setTemperatureDirty: false
+      setTemperatureDirty: false,
+      durationDirty: false
     };
     const combinedSeries = [
       { key: 'average_air_temp', label: 'Air temp avg', color: '#d9563f', axis: 'temperature' },
@@ -490,10 +493,11 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       const safety = document.getElementById('dryingSafety');
       const toggle = document.getElementById('dryingToggle');
       const setTemperature = document.getElementById('setTemperature');
-      const duration = document.getElementById('dryingDuration');
+      const hours = document.getElementById('dryingHours');
+      const minutes = document.getElementById('dryingMinutes');
       const isDrying = drying.state === 'drying';
       const isSafe = drying.temperatures_safe === true;
-      const isLockedOut = drying.state === 'safety' || drying.state === 'timer_expired';
+      const isLockedOut = drying.state === 'safety';
       const normalizedState = drying.state || 'idle';
       const backendSetTemperature = Number(drying.set_temperature_c);
       const displayState = normalizedState === 'drying'
@@ -516,7 +520,12 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
         state.setTemperatureDirty = false;
         setTemperature.value = backendSetTemperature;
       }
-      duration.value = drying.duration_s ? Math.round(drying.duration_s / 60) : 30;
+      if (!state.durationDirty || isDrying || isLockedOut) {
+        const durationMinutes = drying.duration_s ? Math.round(drying.duration_s / 60) : 30;
+        hours.value = Math.floor(durationMinutes / 60);
+        minutes.value = durationMinutes % 60;
+        state.durationDirty = false;
+      }
       safety.className = `drying-safety ${isSafe ? 'safe' : 'unsafe'}`;
       safety.textContent = isSafe
         ? `Temperature safety: armed · 0-65 °C · ${formatTimer(drying.remaining_s || drying.duration_s)}`
@@ -798,9 +807,16 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       const isDrying = drying.state === 'drying';
       const action = isDrying ? 'stop' : 'start';
       const setTemperature = document.getElementById('setTemperature').value;
-      const durationMinutes = document.getElementById('dryingDuration').value;
       const query = new URLSearchParams({ action });
       if (!isDrying) {
+        const hours = document.getElementById('dryingHours');
+        const minutes = document.getElementById('dryingMinutes');
+        if (!hours.reportValidity() || !minutes.reportValidity()) return;
+        const durationMinutes = Number(hours.value) * 60 + Number(minutes.value);
+        if (!Number.isInteger(durationMinutes) || durationMinutes < 1 || durationMinutes > 1440) {
+          setError('Timer must be between 1 minute and 24 hours.');
+          return;
+        }
         query.set('set_temperature', setTemperature);
         query.set('duration_minutes', durationMinutes);
       }
@@ -822,6 +838,11 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       state.setTemperatureC = value;
       state.setTemperatureDirty = true;
       drawCombinedChart();
+    });
+    ['dryingHours', 'dryingMinutes'].forEach(id => {
+      document.getElementById(id).addEventListener('input', () => {
+        state.durationDirty = true;
+      });
     });
     function updateChartHover(event) {
       if (!state.samples.length) return;

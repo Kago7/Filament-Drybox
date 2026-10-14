@@ -41,7 +41,7 @@ constexpr float kMinimumSafeTemperatureC = 0.0f;
 constexpr float kMaximumSafeTemperatureC = 65.0f;
 constexpr float kDefaultDryingSetTemperatureC = 45.0f;
 constexpr uint32_t kDefaultDryingDurationMs = 30UL * 60UL * 1000UL;
-constexpr uint32_t kMaximumDryingDurationMs = 2UL * 60UL * 60UL * 1000UL;
+constexpr uint32_t kMaximumDryingDurationMs = 24UL * 60UL * 60UL * 1000UL;
 constexpr float kHeaterHysteresisC = 0.5f;
 constexpr uint32_t kWifiReconnectIntervalMs = 10000;
 
@@ -212,7 +212,7 @@ const char* dryingSafetyReason() {
     return "Temperature outside 0-65 C";
   }
   if (dryingState == DryingState::TimerExpired) {
-    return "Two-hour maximum timer expired";
+    return "Drying cycle timer expired";
   }
   return "";
 }
@@ -251,7 +251,7 @@ void updateDryingControl(uint32_t now) {
   }
 
   if (now - dryingStartedAtMs >= dryingDurationMs) {
-    dryingState = DryingState::TimerExpired;
+    dryingState = DryingState::Idle;
     forceOutputsOff();
     return;
   }
@@ -435,8 +435,8 @@ void handleDryingControl() {
 
   if (server.hasArg("duration_minutes")) {
     const long requestedMinutes = server.arg("duration_minutes").toInt();
-    if (requestedMinutes <= 0 || requestedMinutes > 120) {
-      server.send(400, "application/json", "{\"error\":\"duration_minutes must be between 1 and 120\"}");
+    if (requestedMinutes <= 0 || requestedMinutes > static_cast<long>(kMaximumDryingDurationMs / (60UL * 1000UL))) {
+      server.send(400, "application/json", "{\"error\":\"duration_minutes must be between 1 and 1440\"}");
       return;
     }
     dryingDurationMs = static_cast<uint32_t>(requestedMinutes) * 60UL * 1000UL;
@@ -706,13 +706,13 @@ void setup() {
 }
 
 void loop() {
-  const uint32_t now = millis();
-  maintainWiFi(now);
+  maintainWiFi(millis());
   if (webServerStarted && wifiWasConnected) {
     server.handleClient();
   }
   updateOled();
 
+  const uint32_t now = millis();
   readSensors(now);
   updateDryingControl(now);
   if (static_cast<int32_t>(now - nextSampleAtMs) >= 0) {
