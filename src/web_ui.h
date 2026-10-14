@@ -280,6 +280,20 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       font-size: 13px;
     }
     .error.visible { display: block; }
+    .device-actions { display: flex; justify-content: end; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+    .reset-button {
+      min-height: 38px;
+      padding: 0 15px;
+      color: var(--bad);
+      background: var(--surface);
+      border: 1px solid var(--bad);
+      border-radius: 5px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .reset-button:hover { background: #fde9e6; }
+    .reset-button:focus-visible { outline: 2px solid var(--bad); outline-offset: 3px; }
+    .reset-button:disabled { cursor: not-allowed; opacity: .45; }
     @media (max-width: 850px) {
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .outputs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -389,6 +403,9 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       <div><div class="storage-label">Free heap</div><div id="heapValue" class="storage-value">--</div></div>
       <div><div class="storage-label">Controller</div><div id="networkValue" class="storage-value">--</div></div>
     </section>
+    <footer class="device-actions">
+      <button id="resetDevice" class="reset-button" type="button">Reset ESP32</button>
+    </footer>
   </main>
 
   <script>
@@ -831,6 +848,25 @@ const char kIndexHtml[] PROGMEM = R"DRYBOX(
       }
     }
 
+    async function resetDevice() {
+      const button = document.getElementById('resetDevice');
+      if (button.disabled) return;
+      button.disabled = true;
+      button.textContent = 'Resetting...';
+      try {
+        const response = await fetch('/api/reset', { method: 'POST', cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        setConnection(false, 'Restarting');
+        setError();
+      } catch (error) {
+        setError(`Reset failed: ${error.message}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Reset ESP32';
+      }
+    }
+
+    document.getElementById('resetDevice').addEventListener('click', resetDevice);
     document.getElementById('dryingToggle').addEventListener('click', toggleDrying);
     document.getElementById('setTemperature').addEventListener('input', event => {
       const value = Number(event.target.value);

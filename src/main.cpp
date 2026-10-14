@@ -640,6 +640,16 @@ void handleHistoryCsv() {
   server.sendContent("");
 }
 
+void handleReset() {
+  dryingState = DryingState::Idle;
+  forceOutputsOff();
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Connection", "close");
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(100);
+  ESP.restart();
+}
+
 void connectToWiFi() {
   wifiConfigured = strcmp(drybox_credentials::kSsid, "YOUR_WIFI_SSID") != 0;
   if (!wifiConfigured) {
@@ -674,6 +684,7 @@ void startWebServer() {
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/history", HTTP_GET, handleHistory);
   server.on("/api/history.csv", HTTP_GET, handleHistoryCsv);
+  server.on("/api/reset", HTTP_POST, handleReset);
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"error\":\"not found\"}");
   });
