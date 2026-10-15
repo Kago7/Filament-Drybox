@@ -42,7 +42,7 @@ constexpr float kMaximumSafeTemperatureC = 65.0f;
 constexpr float kDefaultDryingSetTemperatureC = 45.0f;
 constexpr uint32_t kDefaultDryingDurationMs = 30UL * 60UL * 1000UL;
 constexpr uint32_t kMaximumDryingDurationMs = 24UL * 60UL * 60UL * 1000UL;
-constexpr float kHeaterHysteresisC = 0.5f;
+constexpr float kHeaterHysteresisC = 0.2f;
 constexpr uint32_t kWifiReconnectIntervalMs = 10000;
 
 enum class DryingState : uint8_t {
